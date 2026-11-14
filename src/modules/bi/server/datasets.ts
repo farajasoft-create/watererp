@@ -1,0 +1,417 @@
+import type { PipelineStage } from 'mongoose';
+
+/**
+ * The data every module offers to reports. Each dataset reads one collection of the shared database,
+ * scoped to the organisation, and names its fields with labels and types. A dataset (or a single field,
+ * such as a salary) is only offered to users holding one of its permissions in a module switched on.
+ */
+
+export type FieldType = 'text' | 'number' | 'money' | 'date';
+
+export interface FieldDef {
+  key: string;
+  label: string;
+  type: FieldType;
+  /** A MongoDB expression worked on each document after the dataset's own stages. */
+  expr: unknown;
+  /** Needed in addition to the dataset's own permission (pay, for example). */
+  permission?: string;
+}
+
+export interface DatasetDef {
+  key: string;
+  label: string;
+  module: string;
+  description: string;
+  collection: string;
+  /** Any one of these lets a user query the dataset. */
+  permissions: string[];
+  /** The date that period filters and trends use by default. */
+  dateField: string;
+  /** Stages after the organisation filter: unwinding lines, looking up names. */
+  stages?: PipelineStage[];
+  fields: FieldDef[];
+}
+
+const num = (path: string) => ({ $convert: { input: `$${path}`, to: 'double', onError: null, onNull: null } });
+const hours = (from: string, to: string) => ({ $cond: [{ $and: [`$${from}`, `$${to}`] }, { $round: [{ $divide: [{ $subtract: [`$${to}`, `$${from}`] }, 3_600_000] }, 1] }, null] });
+const yesNo = (cond: unknown) => ({ $cond: [cond, 'Yes', 'No'] });
+
+/** Adds `as` holding one value (e.g. the name) from the document `localField` points to. */
+export function lookup(from: string, localField: string, as: string, value: unknown = '$name'): PipelineStage[] {
+  return [
+    { $lookup: { from, localField, foreignField: '_id', as, pipeline: [{ $project: { _v: value } }] } },
+    { $set: { [as]: { $first: `$${as}._v` } } },
+  ];
+}
+
+export const DATASETS: DatasetDef[] = [
+  {
+    key: 'water.customers',
+    label: 'Water customers',
+    module: 'water',
+    description: 'Every account with its category, zone, status and balance.',
+    collection: 'water_customers',
+    permissions: ['water.customer.view', 'water.reports.view'],
+    dateField: 'connectionDate',
+    stages: lookup('water_zones', 'zoneId', '_zone'),
+    fields: [
+      { key: 'accountNo', label: 'Account', type: 'text', expr: '$accountNo' },
+      { key: 'name', label: 'Customer', type: 'text', expr: '$name' },
+      { key: 'category', label: 'Category', type: 'text', expr: '$category' },
+      { key: 'zone', label: 'Zone', type: 'text', expr: '$_zone' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'sewered', label: 'Sewered', type: 'text', expr: yesNo('$sewered') },
+      { key: 'kyc', label: 'KYC verified', type: 'text', expr: yesNo('$kycVerified') },
+      { key: 'balance', label: 'Balance', type: 'money', expr: num('balance') },
+      { key: 'applicationDate', label: 'Applied', type: 'date', expr: '$applicationDate' },
+      { key: 'connectionDate', label: 'Connected', type: 'date', expr: '$connectionDate' },
+      { key: 'oldestUnpaidDueDate', label: 'Oldest unpaid bill due', type: 'date', expr: '$oldestUnpaidDueDate' },
+    ],
+  },
+  {
+    key: 'water.bills',
+    label: 'Water bills',
+    module: 'water',
+    description: 'Bills by period, category and zone: consumption, charges and amounts due.',
+    collection: 'water_bills',
+    permissions: ['water.reports.view', 'water.billing.run', 'water.billing.approve'],
+    dateField: 'billDate',
+    stages: lookup('water_zones', 'zoneId', '_zone'),
+    fields: [
+      { key: 'billNo', label: 'Bill', type: 'text', expr: '$billNo' },
+      { key: 'period', label: 'Period', type: 'text', expr: '$period' },
+      { key: 'billDate', label: 'Bill date', type: 'date', expr: '$billDate' },
+      { key: 'dueDate', label: 'Due', type: 'date', expr: '$dueDate' },
+      { key: 'accountNo', label: 'Account', type: 'text', expr: '$accountNo' },
+      { key: 'customer', label: 'Customer', type: 'text', expr: '$customerName' },
+      { key: 'category', label: 'Category', type: 'text', expr: '$category' },
+      { key: 'zone', label: 'Zone', type: 'text', expr: '$_zone' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'estimated', label: 'Estimated', type: 'text', expr: yesNo('$estimated') },
+      { key: 'supplementary', label: 'Supplementary', type: 'text', expr: yesNo('$supplementary') },
+      { key: 'units', label: 'Units (m³)', type: 'number', expr: num('units') },
+      { key: 'charges', label: 'Current charges', type: 'money', expr: num('currentCharges') },
+      { key: 'broughtForward', label: 'Brought forward', type: 'money', expr: num('balanceBroughtForward') },
+      { key: 'amountDue', label: 'Amount due', type: 'money', expr: num('amountDue') },
+    ],
+  },
+  {
+    key: 'water.payments',
+    label: 'Water collections',
+    module: 'water',
+    description: 'Receipts by channel and day.',
+    collection: 'water_payments',
+    permissions: ['water.reports.view', 'water.payment.record'],
+    dateField: 'paidAt',
+    fields: [
+      { key: 'receiptNo', label: 'Receipt', type: 'text', expr: '$receiptNo' },
+      { key: 'paidAt', label: 'Paid', type: 'date', expr: '$paidAt' },
+      { key: 'channel', label: 'Channel', type: 'text', expr: '$channel' },
+      { key: 'accountNo', label: 'Account', type: 'text', expr: '$accountNo' },
+      { key: 'payer', label: 'Payer', type: 'text', expr: '$payerName' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'amount', label: 'Amount', type: 'money', expr: num('amount') },
+    ],
+  },
+  {
+    key: 'water.readings',
+    label: 'Meter readings',
+    module: 'water',
+    description: 'Readings by period, zone and exception.',
+    collection: 'water_readings',
+    permissions: ['water.reports.view', 'water.reading.approve'],
+    dateField: 'readAt',
+    stages: lookup('water_zones', 'zoneId', '_zone'),
+    fields: [
+      { key: 'period', label: 'Period', type: 'text', expr: '$period' },
+      { key: 'readAt', label: 'Read', type: 'date', expr: '$readAt' },
+      { key: 'zone', label: 'Zone', type: 'text', expr: '$_zone' },
+      { key: 'type', label: 'Type', type: 'text', expr: '$type' },
+      { key: 'exception', label: 'Exception', type: 'text', expr: { $ifNull: ['$exception', 'NONE'] } },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'units', label: 'Units (m³)', type: 'number', expr: num('units') },
+    ],
+  },
+  {
+    key: 'water.tickets',
+    label: 'Customer complaints and requests',
+    module: 'water',
+    description: 'Tickets by category and channel, with resolution times against the deadline and satisfaction.',
+    collection: 'water_tickets',
+    permissions: ['water.service.view', 'water.reports.view'],
+    dateField: 'createdAt',
+    stages: lookup('water_zones', 'zoneId', '_zone'),
+    fields: [
+      { key: 'number', label: 'Ticket', type: 'text', expr: '$number' },
+      { key: 'createdAt', label: 'Raised', type: 'date', expr: '$createdAt' },
+      { key: 'category', label: 'Category', type: 'text', expr: '$category' },
+      { key: 'channel', label: 'Channel', type: 'text', expr: '$channel' },
+      { key: 'priority', label: 'Priority', type: 'text', expr: '$priority' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'zone', label: 'Zone', type: 'text', expr: '$_zone' },
+      { key: 'resolvedAt', label: 'Resolved', type: 'date', expr: '$resolvedAt' },
+      { key: 'hoursToResolve', label: 'Hours to resolve', type: 'number', expr: hours('createdAt', 'resolvedAt') },
+      { key: 'onTime', label: 'Resolved on time', type: 'text', expr: { $cond: ['$resolvedAt', yesNo({ $lte: ['$resolvedAt', '$slaDueAt'] }), 'Open'] } },
+      { key: 'satisfaction', label: 'Satisfaction (1–5)', type: 'number', expr: '$satisfaction' },
+    ],
+  },
+  {
+    key: 'water.workorders',
+    label: 'Field jobs (work orders)',
+    module: 'water',
+    description: 'Repairs, connections and maintenance jobs with completion times and costs.',
+    collection: 'water_work_orders',
+    permissions: ['water.ops.view', 'water.works.manage'],
+    dateField: 'createdAt',
+    stages: lookup('water_zones', 'zoneId', '_zone'),
+    fields: [
+      { key: 'number', label: 'Job', type: 'text', expr: '$number' },
+      { key: 'createdAt', label: 'Raised', type: 'date', expr: '$createdAt' },
+      { key: 'type', label: 'Type', type: 'text', expr: '$type' },
+      { key: 'priority', label: 'Priority', type: 'text', expr: '$priority' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'zone', label: 'Zone', type: 'text', expr: '$_zone' },
+      { key: 'hoursToComplete', label: 'Hours to complete', type: 'number', expr: hours('createdAt', 'completedAt') },
+      { key: 'onTime', label: 'Done by the deadline', type: 'text', expr: { $cond: ['$completedAt', yesNo({ $lte: ['$completedAt', '$dueAt'] }), 'Open'] } },
+      { key: 'labourHours', label: 'Labour hours', type: 'number', expr: num('labourHours') },
+      { key: 'materialsCost', label: 'Materials cost', type: 'money', expr: num('materialsCost') },
+    ],
+  },
+  {
+    key: 'water.production',
+    label: 'Water production',
+    module: 'water',
+    description: 'Daily abstraction, treatment and supply by facility, with power and downtime.',
+    collection: 'water_production_logs',
+    permissions: ['water.ops.view', 'water.production.record'],
+    dateField: 'date',
+    stages: lookup('water_facilities', 'facilityId', '_facility'),
+    fields: [
+      { key: 'date', label: 'Date', type: 'date', expr: '$date' },
+      { key: 'facility', label: 'Facility', type: 'text', expr: '$_facility' },
+      { key: 'abstracted', label: 'Abstracted (m³)', type: 'number', expr: num('abstracted') },
+      { key: 'treated', label: 'Treated (m³)', type: 'number', expr: num('treated') },
+      { key: 'supplied', label: 'Supplied (m³)', type: 'number', expr: num('supplied') },
+      { key: 'pumpHours', label: 'Pump hours', type: 'number', expr: num('pumpHours') },
+      { key: 'powerKwh', label: 'Power (kWh)', type: 'number', expr: num('powerKwh') },
+      { key: 'downtimeHours', label: 'Downtime hours', type: 'number', expr: num('downtimeHours') },
+    ],
+  },
+  {
+    key: 'hr.employees',
+    label: 'Staff',
+    module: 'hr',
+    description: 'Employees by department, grade, type, gender and status.',
+    collection: 'hr_employees',
+    permissions: ['hr.employee.view'],
+    dateField: 'hireDate',
+    stages: [...lookup('hr_departments', 'departmentId', '_dept'), ...lookup('hr_job_groups', 'jobGroupId', '_group', '$code')],
+    fields: [
+      { key: 'employeeNo', label: 'Employee no', type: 'text', expr: '$employeeNo' },
+      { key: 'name', label: 'Name', type: 'text', expr: { $concat: ['$firstName', ' ', '$lastName'] } },
+      { key: 'department', label: 'Department', type: 'text', expr: '$_dept' },
+      { key: 'jobGroup', label: 'Job group', type: 'text', expr: '$_group' },
+      { key: 'jobTitle', label: 'Job title', type: 'text', expr: '$jobTitle' },
+      { key: 'employmentType', label: 'Employment type', type: 'text', expr: '$employmentType' },
+      { key: 'gender', label: 'Gender', type: 'text', expr: '$gender' },
+      { key: 'station', label: 'Station', type: 'text', expr: '$station' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'hireDate', label: 'Hired', type: 'date', expr: '$hireDate' },
+      { key: 'contractEndDate', label: 'Contract ends', type: 'date', expr: '$contractEndDate' },
+      { key: 'basicSalary', label: 'Basic salary', type: 'money', expr: num('basicSalary'), permission: 'hr.salary.view' },
+    ],
+  },
+  {
+    key: 'hr.payroll',
+    label: 'Payroll (payslips)',
+    module: 'hr',
+    description: 'Approved and paid payslips: gross, deductions, net and employer cost.',
+    collection: 'hr_payslips',
+    permissions: ['hr.salary.view'],
+    dateField: 'periodStart',
+    stages: [{ $match: { status: { $in: ['APPROVED', 'PAID'] } } }, { $set: { periodStart: { $dateFromString: { dateString: { $concat: ['$period', '-01'] }, onError: null } } } }],
+    fields: [
+      { key: 'period', label: 'Period', type: 'text', expr: '$period' },
+      { key: 'periodStart', label: 'Month', type: 'date', expr: '$periodStart' },
+      { key: 'employeeNo', label: 'Employee no', type: 'text', expr: '$employee.employeeNo' },
+      { key: 'name', label: 'Name', type: 'text', expr: '$employee.name' },
+      { key: 'department', label: 'Department', type: 'text', expr: '$employee.department' },
+      { key: 'gross', label: 'Gross pay', type: 'money', expr: num('gross') },
+      { key: 'paye', label: 'PAYE', type: 'money', expr: num('paye') },
+      { key: 'nssf', label: 'NSSF (employee)', type: 'money', expr: num('nssfEmployee') },
+      { key: 'shif', label: 'SHIF', type: 'money', expr: num('shif') },
+      { key: 'ahl', label: 'Housing levy', type: 'money', expr: num('ahlEmployee') },
+      { key: 'netPay', label: 'Net pay', type: 'money', expr: num('netPay') },
+      { key: 'employerCost', label: 'Employer cost', type: 'money', expr: num('employerCost') },
+    ],
+  },
+  {
+    key: 'hr.payLines',
+    label: 'Payroll lines (every earning and deduction)',
+    module: 'hr',
+    description: 'One row per payslip line of approved and paid payrolls: allowances, deductions, statutory and scheme lines by code, for any payroll report.',
+    collection: 'hr_payslips',
+    permissions: ['hr.salary.view'],
+    dateField: 'periodStart',
+    stages: [{ $match: { status: { $in: ['APPROVED', 'PAID'] } } }, { $unwind: '$lines' }, { $set: { periodStart: { $dateFromString: { dateString: { $concat: ['$period', '-01'] }, onError: null } } } }],
+    fields: [
+      { key: 'period', label: 'Period', type: 'text', expr: '$period' },
+      { key: 'periodStart', label: 'Month', type: 'date', expr: '$periodStart' },
+      { key: 'employeeNo', label: 'Employee no', type: 'text', expr: '$employee.employeeNo' },
+      { key: 'name', label: 'Name', type: 'text', expr: '$employee.name' },
+      { key: 'department', label: 'Department', type: 'text', expr: '$employee.department' },
+      { key: 'lineType', label: 'Line type', type: 'text', expr: '$lines.type' },
+      { key: 'code', label: 'Code', type: 'text', expr: '$lines.code' },
+      { key: 'line', label: 'Line', type: 'text', expr: '$lines.name' },
+      { key: 'amount', label: 'Amount', type: 'money', expr: num('lines.amount') },
+    ],
+  },
+  {
+    key: 'hr.leave',
+    label: 'Leave',
+    module: 'hr',
+    description: 'Leave requests by type, department and status.',
+    collection: 'hr_leave_requests',
+    permissions: ['hr.leave.view'],
+    dateField: 'startDate',
+    stages: [...lookup('hr_departments', 'departmentId', '_dept'), ...lookup('hr_leave_types', 'leaveTypeId', '_type')],
+    fields: [
+      { key: 'startDate', label: 'From', type: 'date', expr: '$startDate' },
+      { key: 'endDate', label: 'To', type: 'date', expr: '$endDate' },
+      { key: 'leaveType', label: 'Leave type', type: 'text', expr: '$_type' },
+      { key: 'department', label: 'Department', type: 'text', expr: '$_dept' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'days', label: 'Days', type: 'number', expr: num('days') },
+      { key: 'hoursToDecide', label: 'Hours to decide', type: 'number', expr: hours('createdAt', 'reviewedAt') },
+    ],
+  },
+  {
+    key: 'finance.ledger',
+    label: 'General ledger postings',
+    module: 'finance',
+    description: 'Every posted ledger line with account, branch, department and project.',
+    collection: 'finance_ledgerentries',
+    permissions: ['finance.access'],
+    dateField: 'date',
+    stages: [
+      ...lookup('finance_accounts', 'accountId', '_acc', { $concat: ['$code', ' ', '$name'] }),
+      ...lookup('finance_branches', 'branchId', '_branch'),
+      ...lookup('finance_dimensionvalues', 'departmentId', '_dept'),
+      ...lookup('finance_dimensionvalues', 'projectId', '_project'),
+    ],
+    fields: [
+      { key: 'date', label: 'Date', type: 'date', expr: '$date' },
+      { key: 'journal', label: 'Journal', type: 'text', expr: '$journalNumber' },
+      { key: 'account', label: 'Account', type: 'text', expr: '$_acc' },
+      { key: 'accountClass', label: 'Account class', type: 'text', expr: '$accountClass' },
+      { key: 'branch', label: 'Branch', type: 'text', expr: '$_branch' },
+      { key: 'department', label: 'Department', type: 'text', expr: '$_dept' },
+      { key: 'project', label: 'Project', type: 'text', expr: '$_project' },
+      { key: 'source', label: 'Source', type: 'text', expr: '$source' },
+      { key: 'description', label: 'Description', type: 'text', expr: '$description' },
+      { key: 'debit', label: 'Debit', type: 'money', expr: num('debit') },
+      { key: 'credit', label: 'Credit', type: 'money', expr: num('credit') },
+      { key: 'net', label: 'Net (debit − credit)', type: 'money', expr: { $subtract: [num('debit'), num('credit')] } },
+    ],
+  },
+  {
+    key: 'ict.tickets',
+    label: 'IT help desk tickets',
+    module: 'ict',
+    description: 'Help desk tickets with response and resolution times and ratings.',
+    collection: 'ict_tickets',
+    permissions: ['ict.reports.view', 'ict.helpdesk.work'],
+    dateField: 'createdAt',
+    fields: [
+      { key: 'number', label: 'Ticket', type: 'text', expr: '$number' },
+      { key: 'createdAt', label: 'Raised', type: 'date', expr: '$createdAt' },
+      { key: 'category', label: 'Category', type: 'text', expr: '$category' },
+      { key: 'priority', label: 'Priority', type: 'text', expr: '$priority' },
+      { key: 'channel', label: 'Channel', type: 'text', expr: '$channel' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'department', label: 'Department', type: 'text', expr: '$department' },
+      { key: 'officer', label: 'Officer', type: 'text', expr: '$assignedName' },
+      { key: 'hoursToResolve', label: 'Hours to resolve', type: 'number', expr: hours('createdAt', 'resolvedAt') },
+      { key: 'onTime', label: 'Resolved on time', type: 'text', expr: { $cond: ['$resolvedAt', yesNo({ $lte: ['$resolvedAt', '$resolveBy'] }), 'Open'] } },
+      { key: 'rating', label: 'Rating (1–5)', type: 'number', expr: '$rating' },
+    ],
+  },
+  {
+    key: 'internalaudit.findings',
+    label: 'Audit findings and actions',
+    module: 'internalaudit',
+    description: 'Findings by rating and status, with action owners and due dates.',
+    collection: 'internalaudit_findings',
+    permissions: ['internalaudit.reports.view', 'internalaudit.engagement.manage'],
+    dateField: 'createdAt',
+    stages: [{ $match: { status: { $ne: 'DRAFT' } } }, ...lookup('internalaudit_engagements', 'engagementId', '_eng', '$number')],
+    fields: [
+      { key: 'engagement', label: 'Engagement', type: 'text', expr: '$_eng' },
+      { key: 'ref', label: 'Ref', type: 'text', expr: '$ref' },
+      { key: 'title', label: 'Finding', type: 'text', expr: '$title' },
+      { key: 'rating', label: 'Rating', type: 'text', expr: '$rating' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'owner', label: 'Action owner', type: 'text', expr: '$ownerName' },
+      { key: 'createdAt', label: 'Raised', type: 'date', expr: '$createdAt' },
+      { key: 'dueDate', label: 'Due', type: 'date', expr: '$dueDate' },
+      { key: 'daysOverdue', label: 'Days overdue', type: 'number', expr: { $cond: [{ $and: [{ $in: ['$status', ['AGREED', 'IN_PROGRESS']] }, { $lt: ['$dueDate', '$$NOW'] }] }, { $floor: { $divide: [{ $subtract: ['$$NOW', '$dueDate'] }, 86_400_000] } }, 0] } },
+    ],
+  },
+  {
+    key: 'core.warehouse',
+    label: 'Data warehouse: daily figures',
+    module: 'core',
+    description: 'Key figures from every module as they stood each day (connections, arrears, billing, collections, headcount, stock, backlogs), kept unchanged for trend reporting.',
+    collection: 'warehouse_facts',
+    permissions: ['bi.admin'],
+    dateField: 'day',
+    stages: [{ $set: { day: { $dateFromString: { dateString: '$date', onError: null } } } }],
+    fields: [
+      { key: 'day', label: 'Date', type: 'date', expr: '$day' },
+      { key: 'module', label: 'Module', type: 'text', expr: '$module' },
+      { key: 'metric', label: 'Figure', type: 'text', expr: '$label' },
+      { key: 'value', label: 'Value', type: 'number', expr: '$value' },
+    ],
+  },
+  {
+    key: 'core.tasks',
+    label: 'Tasks (all departments)',
+    module: 'core',
+    description: 'Cross-department tasks with turnaround and lateness.',
+    collection: 'tasks',
+    permissions: ['bi.admin'],
+    dateField: 'createdAt',
+    fields: [
+      { key: 'number', label: 'Task', type: 'text', expr: '$number' },
+      { key: 'title', label: 'Title', type: 'text', expr: '$title' },
+      { key: 'module', label: 'Module', type: 'text', expr: { $ifNull: ['$module', 'general'] } },
+      { key: 'department', label: 'Department', type: 'text', expr: '$department' },
+      { key: 'priority', label: 'Priority', type: 'text', expr: '$priority' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'createdAt', label: 'Created', type: 'date', expr: '$createdAt' },
+      { key: 'hoursToComplete', label: 'Hours to complete', type: 'number', expr: hours('createdAt', 'completedAt') },
+      { key: 'late', label: 'Late', type: 'text', expr: { $cond: [{ $and: ['$dueAt', { $gt: [{ $ifNull: ['$completedAt', '$$NOW'] }, '$dueAt'] }] }, 'Yes', 'No'] } },
+    ],
+  },
+  {
+    key: 'core.approvals',
+    label: 'Approvals (all modules)',
+    module: 'core',
+    description: 'Documents through approval: how long each took and how it ended.',
+    collection: 'approval_requests',
+    permissions: ['bi.admin'],
+    dateField: 'createdAt',
+    fields: [
+      { key: 'module', label: 'Module', type: 'text', expr: '$module' },
+      { key: 'docType', label: 'Document', type: 'text', expr: '$docType' },
+      { key: 'title', label: 'Title', type: 'text', expr: '$title' },
+      { key: 'status', label: 'Status', type: 'text', expr: '$status' },
+      { key: 'amount', label: 'Amount', type: 'money', expr: num('amount') },
+      { key: 'createdAt', label: 'Requested', type: 'date', expr: '$createdAt' },
+      { key: 'hoursToDecide', label: 'Hours to decide', type: 'number', expr: { $cond: [{ $ne: ['$status', 'PENDING'] }, hours('createdAt', 'updatedAt'), null] } },
+    ],
+  },
+];
+
+export const datasetByKey = (key: string) => DATASETS.find((d) => d.key === key);
