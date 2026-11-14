@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { AUTH_COOKIE, SESSION_SECONDS } from './auth';
+import { HttpError } from './common/errors';
 import { escapeRegex, parseId, zDate, zId, zPage } from './common/validation';
 import { route } from './http/route';
 import { CORE_PERMISSIONS as P } from './manifest';
@@ -8,6 +9,15 @@ import { workflowRoutes } from './routes-workflow';
 
 const secure = process.env.NODE_ENV === 'production' && process.env.COOKIE_SECURE !== 'false';
 const optionalText = (max: number) => z.string().trim().max(max).optional();
+
+/** Back to the sign-in page with a reason a person can act on; unexpected errors stay in the server log. */
+function ssoFailed(origin: string, err: unknown, org?: string) {
+  if (!(err instanceof HttpError)) console.error('Single sign-on failed', err);
+  const reason = err instanceof HttpError ? err.message : 'Single sign-on failed; try again or sign in with your password';
+  const params = new URLSearchParams({ error: reason });
+  if (org) params.set('org', org);
+  return new Response(null, { status: 302, headers: { location: `${origin}/login?${params}` } });
+}
 
 const UserBody = z.object({
   name: z.string().trim().min(1).max(100),
@@ -66,7 +76,15 @@ const authRoutes = [
     public: true,
     rateLimit: 30,
     query: z.object({ org: z.string().trim().min(1).max(20), next: z.string().max(300).optional() }),
-    handler: async ({ s, query, req }) => Response.redirect(await s.sso.start(query.org, new URL(req.url).origin, query.next), 302),
+    // Failures go back to the sign-in page with the reason, not to a bare JSON error.
+    handler: async ({ s, query, req }) => {
+      const origin = new URL(req.url).origin;
+      try {
+        return Response.redirect(await s.sso.start(query.org, origin, query.next), 302);
+      } catch (err) {
+        return ssoFailed(origin, err, query.org);
+      }
+    },
   }),
   route({
     method: 'GET',
@@ -76,7 +94,13 @@ const authRoutes = [
     query: z.object({ code: z.string().min(1).max(4000), state: z.string().min(1).max(4000) }),
     handler: async ({ s, query, req, ip }) => {
       const origin = new URL(req.url).origin;
-      const { token, next } = await s.sso.callback(query.code, query.state, origin, ip);
+      let signedIn: { token: string; next: string };
+      try {
+        signedIn = await s.sso.callback(query.code, query.state, origin, ip);
+      } catch (err) {
+        return ssoFailed(origin, err);
+      }
+      const { token, next } = signedIn;
       const res = new Response(null, { status: 302, headers: { location: `${origin}${next}` } });
       res.headers.append('Set-Cookie', `${AUTH_COOKIE}=${encodeURIComponent(token)}; Path=/; SameSite=Lax; HttpOnly; Max-Age=${SESSION_SECONDS}${secure ? '; Secure' : ''}`);
       return res;

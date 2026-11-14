@@ -97,7 +97,15 @@ describe('single sign-on', () => {
       const me = await app.call<{ email: string }>('sso', 'GET', '/auth/me');
       expect(me.email).toBe('boss@test.co');
       const forged = await app.raw('sso2', 'GET', '/auth/sso/callback?code=abc&state=forged');
-      expect(forged.status).toBe(401);
+      // A failure goes back to the sign-in page with the reason, and signs nobody in.
+      expect(forged.status).toBe(302);
+      const failed = new URL(forged.headers.get('location')!);
+      expect(failed.pathname).toBe('/login');
+      expect(failed.searchParams.get('error')).toMatch(/start again/);
+      expect(forged.headers.get('set-cookie')).toBeNull();
+      const unknown = await app.raw('anon', 'GET', '/auth/sso/start?org=NOWHERE');
+      expect(unknown.status).toBe(302);
+      expect(new URL(unknown.headers.get('location')!).searchParams.get('error')).toMatch(/not set up/);
     } finally {
       vi.stubGlobal('fetch', outer);
     }
